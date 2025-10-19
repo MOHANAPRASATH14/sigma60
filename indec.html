@@ -1,1 +1,258 @@
-googlr
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>RC Charging Simulator</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; margin: 20px; }
+  h1 { margin: 0 0 10px 0; font-size: 1.3rem; }
+  .controls { display:flex; gap:12px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
+  label { font-size: .9rem; }
+  input[type="range"] { width:160px; }
+  input[type="number"] { width:90px; }
+  button { padding:8px 12px; border-radius:8px; border:1px solid #ccc; cursor:pointer; background:#f5f5f5; }
+  canvas { border:1px solid #ddd; background:#fff; display:block; margin-top:12px; width:100%; max-width:900px; height:300px; }
+  .stats { margin-top:8px; font-size:.9rem; color:#333; }
+  .small { font-size:.85rem; color:#555; }
+</style>
+</head>
+<body>
+  <h1>RC Charging Simulator</h1>
+  <div class="controls">
+    <label>R (Ω)
+      <input id="Rrange" type="range" min="10" max="100000" step="10" value="10000">
+      <input id="Rnum" type="number" min="1" max="1000000" value="10000">
+    </label>
+
+    <label>C (µF)
+      <input id="Crange" type="range" min="0.01" max="1000" step="0.01" value="1">
+      <input id="Cnum" type="number" min="0.001" max="10000" step="0.001" value="1">
+    </label>
+
+    <label>V<sub>in</sub> (V)
+      <input id="Vnum" type="number" step="0.1" value="5">
+    </label>
+
+    <label>Sim dt (ms)
+      <input id="dt" type="number" min="1" max="200" value="20">
+    </label>
+
+    <button id="start">Start</button>
+    <button id="stop">Stop</button>
+    <button id="reset">Reset</button>
+  </div>
+
+  <div class="small">Equation: <em>V(t) = V<sub>in</sub> · (1 − e<sup>−t/RC</sup>)</em></div>
+
+  <canvas id="plot" width="900" height="300"></canvas>
+
+  <div class="stats">
+    <span id="timeDisplay">t = 0.000 s</span> ·
+    <span id="vcapDisplay">V<sub>c</sub> = 0.000 V</span> ·
+    <span id="tauDisplay">τ = 0.000 s</span>
+  </div>
+
+<script>
+(() => {
+  // DOM
+  const Rrange = document.getElementById('Rrange'), Rnum = document.getElementById('Rnum');
+  const Crange = document.getElementById('Crange'), Cnum = document.getElementById('Cnum');
+  const Vnum = document.getElementById('Vnum'), dtInput = document.getElementById('dt');
+  const startBtn = document.getElementById('start'), stopBtn = document.getElementById('stop'), resetBtn = document.getElementById('reset');
+  const canvas = document.getElementById('plot'), ctx = canvas.getContext('2d');
+  const timeDisplay = document.getElementById('timeDisplay'), vcapDisplay = document.getElementById('vcapDisplay'), tauDisplay = document.getElementById('tauDisplay');
+
+  // sync range & number inputs
+  function tie(range, num) {
+    range.addEventListener('input', ()=> num.value = range.value);
+    num.addEventListener('input', ()=> range.value = num.value);
+  }
+  tie(Rrange,Rnum); tie(Crange,Cnum);
+
+  // state
+  let running = false, t = 0;
+  let Vc = 0; // capacitor voltage (V)
+  let history = []; // [{t, v}]
+  const width = canvas.width, height = canvas.height;
+  const padding = 40;
+
+  function clearCanvas(){
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0,0,width,height);
+    // axes
+    ctx.strokeStyle = '#bbb';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(padding, padding);
+    ctx.lineTo(padding, height - padding);
+    ctx.lineTo(width - padding, height - padding);
+    ctx.stroke();
+  }
+
+  function drawGrid(){
+    ctx.strokeStyle = '#eee';
+    ctx.lineWidth = 1;
+    // vertical grid
+    for(let i=0;i<8;i++){
+      const x = padding + (i/7) * (width - 2*padding);
+      ctx.beginPath(); ctx.moveTo(x,padding); ctx.lineTo(x,height-padding); ctx.stroke();
+    }
+    // horizontal grid
+    for(let i=0;i<6;i++){
+      const y = padding + (i/5) * (height - 2*padding);
+      ctx.beginPath(); ctx.moveTo(padding,y); ctx.lineTo(width-padding,y); ctx.stroke();
+    }
+  }
+
+  function drawAxesLabels(maxT, maxV){
+    ctx.fillStyle = '#333';
+    ctx.font = '12px sans-serif';
+    ctx.fillText('V_c (V)', 6, padding - 6);
+    ctx.fillText('t (s)', width - padding - 20, height - 8);
+    // ticks Y
+    for(let i=0;i<=5;i++){
+      const v = (i/5)*maxV;
+      const y = height - padding - (i/5)*(height - 2*padding);
+      ctx.fillText(v.toFixed(2), padding - 36, y + 4);
+    }
+    // ticks X
+    for(let i=0;i<=7;i++){
+      const tt = (i/7)*maxT;
+      const x = padding + (i/7)*(width - 2*padding);
+      ctx.fillText(tt.toFixed(2), x-10, height - padding + 16);
+    }
+  }
+
+  function plotData(maxT, maxV){
+    clearCanvas();
+    drawGrid();
+    drawAxesLabels(maxT, maxV);
+
+    // theoretical curve: V(t) = Vin*(1 - exp(-t/(R*C)))
+    const R = parseFloat(Rnum.value);
+    const C = parseFloat(Cnum.value) * 1e-6; // µF -> F
+    const Vin = parseFloat(Vnum.value);
+    const tau = R*C;
+
+    // plot theory line
+    ctx.beginPath();
+    for(let i=0;i<=400;i++){
+      const fraction = i/400;
+      const tt = fraction * maxT;
+      const v = Vin * (1 - Math.exp(-tt / tau));
+      const x = padding + fraction * (width - 2*padding);
+      const y = height - padding - (v/maxV) * (height - 2*padding);
+      if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.strokeStyle = '#0077aa';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // plot numeric history (points + line)
+    if(history.length>0){
+      ctx.beginPath();
+      for(let i=0;i<history.length;i++){
+        const fraction = history[i].t / maxT;
+        const x = padding + fraction * (width - 2*padding);
+        const y = height - padding - (history[i].v / maxV) * (height - 2*padding);
+        if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+      }
+      ctx.strokeStyle = '#aa7700';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // points
+      for(let p of history){
+        const fraction = p.t / maxT;
+        const x = padding + fraction * (width - 2*padding);
+        const y = height - padding - (p.v / maxV) * (height - 2*padding);
+        ctx.fillStyle = '#aa7700';
+        ctx.beginPath();
+        ctx.arc(x,y,2,0,Math.PI*2);
+        ctx.fill();
+      }
+    }
+  }
+
+  // simulation step using exact ODE solution over dt (analytical update) to avoid numeric instability:
+  // dVc/dt = (Vin - Vc)/(R*C) => over a time step dt: Vc(t+dt) = Vin - (Vin - Vc(t)) * exp(-dt/(R*C))
+  function step(dt_s){
+    const R = parseFloat(Rnum.value);
+    const C = parseFloat(Cnum.value) * 1e-6;
+    const Vin = parseFloat(Vnum.value);
+    const tau = R*C;
+    if(tau <= 0) return;
+    const expf = Math.exp(-dt_s / tau);
+    Vc = Vin - (Vin - Vc) * expf;
+    t += dt_s;
+    history.push({t: t, v: Vc});
+  }
+
+  // controls and loop
+  let rafId = null;
+  function animate(){
+    if(!running) return;
+    const dt_ms = Math.max(1, Number(dtInput.value));
+    // run one simulation step per dt_ms (use setTimeout-like pacing with requestAnimationFrame)
+    step(dt_ms/1000);
+    updateDisplays();
+    // choose axis scaling: show upto 5*tau or at least current t
+    const R = parseFloat(Rnum.value);
+    const C = parseFloat(Cnum.value) * 1e-6;
+    const Vin = parseFloat(Vnum.value);
+    const tau = R*C;
+    const maxT = Math.max(5*tau, t, 0.01);
+    const maxV = Math.max(Vin * 1.05, 0.1);
+    plotData(maxT, maxV);
+    // schedule next
+    setTimeout(()=> { rafId = requestAnimationFrame(animate); }, dt_ms);
+  }
+
+  function updateDisplays(){
+    timeDisplay.textContent = `t = ${t.toFixed(3)} s`;
+    vcapDisplay.innerHTML = `V<sub>c</sub> = ${Vc.toFixed(3)} V`;
+    const R = parseFloat(Rnum.value);
+    const C = parseFloat(Cnum.value) * 1e-6;
+    const tau = R*C;
+    tauDisplay.textContent = `τ = ${tau.toFixed(4)} s`;
+  }
+
+  startBtn.addEventListener('click', ()=>{
+    if(!running){
+      running = true;
+      // if it's a fresh start and history empty, ensure Vc = 0 and t = 0
+      if(history.length === 0) { Vc = 0; t = 0; }
+      animate();
+    }
+  });
+
+  stopBtn.addEventListener('click', ()=>{
+    running = false;
+    if(rafId) cancelAnimationFrame(rafId);
+  });
+
+  resetBtn.addEventListener('click', ()=>{
+    running = false;
+    if(rafId) cancelAnimationFrame(rafId);
+    t = 0; Vc = 0; history = [];
+    updateDisplays();
+    plotData(1, parseFloat(Vnum.value) || 5);
+  });
+
+  // when inputs change, redraw
+  [Rrange,Rnum,Crange,Cnum,Vnum].forEach(el=>{
+    el.addEventListener('input', ()=>{
+      // update tau display and redraw
+      updateDisplays();
+      plotData(1, parseFloat(Vnum.value) || 5);
+    });
+  });
+
+  // initial draw
+  updateDisplays();
+  plotData(1, parseFloat(Vnum.value) || 5);
+})();
+</script>
+</body>
+</html>
